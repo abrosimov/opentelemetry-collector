@@ -1,0 +1,29 @@
+# Use this changelog template to create an entry for release notes.
+
+# One of 'breaking', 'deprecation', 'new_component', 'enhancement', 'bug_fix'
+change_type: bug_fix
+
+# The name of the component, or a single word describing the area of concern, (e.g. receiver/otlp)
+component: pkg/exporterhelper
+
+# A brief description of the change.  Surround your text with quotes ("") if it needs to start with a backtick (`).
+note: Keep a persistent queue item whose dispatch cannot be written to storage, and move dispatched items back to the queue at start-up in one storage transaction.
+
+# One or more tracking issues or pull requests related to the change
+issues: []
+
+# (Optional) One or more lines of additional information to render under the primary note.
+# These lines will be padded with 2 spaces and then inserted directly into the document.
+# Use pipe (|) for multiline entries.
+subtext: |
+  Previously a failed write of the dispatch metadata, for example at the storage's size limit, deleted the
+  item although it had been accepted, and a crash between deleting and re-adding the items that were being
+  dispatched at start-up lost them. The reader now leaves the item in place and reads it again after a short
+  wait, and the start-up move either completes or leaves the storage unchanged for the next start.
+
+# Optional: The change log or logs in which this entry should be included.
+# e.g. '[user]' or '[user, api]'
+# Include 'user' if the change is relevant to end users.
+# Include 'api' if there is a change to a library API.
+# Default: '[user]'
+change_logs: [user]

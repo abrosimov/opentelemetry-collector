@@ -973,7 +973,14 @@ func TestPersistentQueue_FailedOfferKeepsSize(t *testing.T) {
 	}
 }
 
-func TestPersistentQueue_ItemDroppedOnReadReleasesSpace(t *testing.T) {
+func shortenReadRetryInterval(t *testing.T) {
+	previous := readRetryInterval
+	readRetryInterval = 10 * time.Millisecond
+	t.Cleanup(func() { readRetryInterval = previous })
+}
+
+func TestPersistentQueue_FailedDispatchKeepsItem(t *testing.T) {
+	shortenReadRetryInterval(t)
 	client := newFakeStorageClientWithFailingSets(t, storagetest.NewMockStorageExtension(nil))
 	set := newSettingsWithStorage(request.SizerTypeItems, 60)
 	set.BlockOnOverflow = true
@@ -995,20 +1002,68 @@ func TestPersistentQueue_ItemDroppedOnReadReleasesSpace(t *testing.T) {
 		return pq.hasMoreSpace.waiting == 1
 	}, time.Second, time.Millisecond)
 
-	// Persisting the dispatch of the first item fails, so the queue drops it.
-	client.failSets.Store(1)
+	// Persisting the dispatch fails twice, as on a full disk. The item is neither dropped nor skipped:
+	// the reader waits and then reads the same item again.
+	client.failSets.Store(2)
 	_, req, done, ok := pq.Read(context.Background())
 	require.True(t, ok)
-	assert.Equal(t, intRequest(20), req)
+	assert.Equal(t, intRequest(40), req)
+	assert.Equal(t, int64(0), client.failSets.Load())
+	assert.Equal(t, int64(60), pq.Size())
+	requireCurrentlyDispatchedItemsEqual(t, pq, []uint64{0})
 
+	done.OnDone(nil)
 	require.NoError(t, <-offerErr)
 	assert.Equal(t, int64(50), pq.Size())
-	done.OnDone(nil)
-	assert.Equal(t, int64(30), pq.Size())
+	for _, want := range []intRequest{20, 30} {
+		require.True(t, consume(pq, func(_ context.Context, got intRequest) error {
+			assert.Equal(t, want, got)
+			return nil
+		}))
+	}
+	assert.Equal(t, int64(0), pq.Size())
 	require.NoError(t, pq.Shutdown(context.Background()))
 }
 
-func TestPersistentQueue_FailedRequeueOnStartReleasesSize(t *testing.T) {
+func TestPersistentQueue_FailedDispatchKeepsItemAcrossRestart(t *testing.T) {
+	shortenReadRetryInterval(t)
+	ext := storagetest.NewMockStorageExtension(nil)
+	client := newFakeStorageClientWithFailingSets(t, ext)
+	pq := newPersistentQueue[intRequest](newSettingsWithStorage(request.SizerTypeItems, 100)).(*persistentQueue[intRequest])
+	pq.initClient(context.Background(), client)
+	require.NoError(t, pq.Offer(context.Background(), intRequest(40)))
+
+	// Every dispatch fails until the queue stops; Read must then return promptly.
+	client.failSets.Store(1 << 30)
+	readDone := make(chan bool, 1)
+	go func() {
+		_, _, _, ok := pq.Read(context.Background())
+		readDone <- ok
+	}()
+	require.Eventually(t, func() bool {
+		pq.mu.Lock()
+		defer pq.mu.Unlock()
+		return pq.readFailures > 1
+	}, 5*time.Second, time.Millisecond)
+	require.NoError(t, pq.Shutdown(context.Background()))
+	select {
+	case ok := <-readDone:
+		assert.False(t, ok)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Read did not return after Shutdown")
+	}
+
+	newPQ := createTestPersistentQueueWithItemsSizer(t, ext, 100)
+	assert.Equal(t, int64(40), newPQ.Size())
+	require.True(t, consume(newPQ, func(_ context.Context, got intRequest) error {
+		assert.Equal(t, intRequest(40), got)
+		return nil
+	}))
+	assert.Equal(t, int64(0), newPQ.Size())
+	require.NoError(t, newPQ.Shutdown(context.Background()))
+}
+
+func TestPersistentQueue_FailedRequeueOnStartKeepsItems(t *testing.T) {
 	ext := storagetest.NewMockStorageExtension(nil)
 	pq := createTestPersistentQueueWithItemsSizer(t, ext, 100)
 	require.NoError(t, pq.Offer(context.Background(), intRequest(40)))
@@ -1018,13 +1073,30 @@ func TestPersistentQueue_FailedRequeueOnStartReleasesSize(t *testing.T) {
 	}))
 	require.NoError(t, pq.Shutdown(context.Background()))
 
+	// The move of the dispatched item fails as one transaction, so it stays where it was and keeps its size.
 	client := newFakeStorageClientWithFailingSets(t, ext)
 	client.failSets.Store(1)
 	newPQ := newPersistentQueue[intRequest](newSettingsWithStorage(request.SizerTypeItems, 100)).(*persistentQueue[intRequest])
 	newPQ.initClient(context.Background(), client)
-
-	assert.Equal(t, int64(20), newPQ.Size())
+	assert.Equal(t, int64(60), newPQ.Size())
+	requireCurrentlyDispatchedItemsEqual(t, newPQ, []uint64{0})
+	require.True(t, consume(newPQ, func(_ context.Context, got intRequest) error {
+		assert.Equal(t, intRequest(20), got)
+		return nil
+	}))
+	assert.Equal(t, int64(40), newPQ.Size())
 	require.NoError(t, newPQ.Shutdown(context.Background()))
+
+	// The next start moves it.
+	lastPQ := createTestPersistentQueueWithItemsSizer(t, ext, 100)
+	assert.Equal(t, int64(40), lastPQ.Size())
+	requireCurrentlyDispatchedItemsEqual(t, lastPQ, nil)
+	require.True(t, consume(lastPQ, func(_ context.Context, got intRequest) error {
+		assert.Equal(t, intRequest(40), got)
+		return nil
+	}))
+	assert.Equal(t, int64(0), lastPQ.Size())
+	require.NoError(t, lastPQ.Shutdown(context.Background()))
 }
 
 func TestPersistentQueue_ItemDispatchingFinish_ErrorHandling(t *testing.T) {
