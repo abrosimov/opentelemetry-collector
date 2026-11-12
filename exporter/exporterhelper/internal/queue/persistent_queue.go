@@ -85,6 +85,7 @@ type persistentQueue[T request.Request] struct {
 	storageID   component.ID
 	id          component.ID
 	signal      pipeline.Signal
+	compression StorageCompression
 	stopCh      chan struct{}
 	stopOnce    sync.Once
 
@@ -113,6 +114,7 @@ func newPersistentQueue[T request.Request](set Settings[T]) readableQueue[T] {
 		storageID:       *set.StorageID,
 		id:              set.ID,
 		signal:          set.Signal,
+		compression:     set.StorageCompression,
 		stopCh:          make(chan struct{}),
 		blockOnOverflow: set.BlockOnOverflow,
 	}
@@ -278,7 +280,8 @@ func (pq *persistentQueue[T]) unrefClient(ctx context.Context) error {
 // without violating capacity restrictions. If success returns no error.
 // It returns ErrQueueIsFull if no space is currently available.
 func (pq *persistentQueue[T]) Offer(ctx context.Context, req T) error {
-	// Encode before taking the lock: encoding reads nothing the lock guards.
+	// Encode before taking the lock: with storage compression the size the item takes is known only once
+	// it is encoded, and encoding reads nothing the lock guards.
 	buf, err := pq.encode(ctx, req)
 	if err != nil {
 		return err
@@ -310,18 +313,27 @@ func (pq *persistentQueue[T]) Offer(ctx context.Context, req T) error {
 	return nil
 }
 
-// encode returns the form in which the request is stored.
+// encode marshals the request and, when storage compression is enabled, compresses it.
 func (pq *persistentQueue[T]) encode(ctx context.Context, req T) ([]byte, error) {
-	return pq.encoding.Marshal(ctx, req)
+	buf, err := pq.encoding.Marshal(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	return compressStoredItem(pq.compression, buf), nil
 }
 
-// decode returns the request from its stored form.
+// decode returns the request from its stored form, compressed or not.
 func (pq *persistentQueue[T]) decode(stored []byte) (context.Context, T, error) {
-	return pq.encoding.Unmarshal(stored)
+	return pq.encoding.Unmarshal(decompressStoredItem(stored))
 }
 
-// bytesSizeOf returns the size the bytes sizer counts for a stored item.
-func (pq *persistentQueue[T]) bytesSizeOf(req T, _ []byte) int64 {
+// bytesSizeOf returns the size the bytes sizer counts for a stored item. With storage compression it is
+// the size the item takes in storage, so that `queue_size` and the storage's own size limit are measured
+// in the same unit; otherwise it is the size of the uncompressed request.
+func (pq *persistentQueue[T]) bytesSizeOf(req T, stored []byte) int64 {
+	if pq.compression.Enabled() {
+		return int64(len(stored))
+	}
 	return pq.bytesSizer.Sizeof(req)
 }
 
@@ -569,7 +581,7 @@ func (pq *persistentQueue[T]) enqueueNotDispatchedReqs(ctx context.Context, disp
 			pq.logger.Warn("Failed unmarshalling item", zap.String(zapKey, op.Key), zap.Error(err))
 			continue
 		}
-		// The stored value is moved as it is.
+		// The stored value is moved as it is, compressed or not.
 		moveBatch = append(moveBatch, storage.SetOperation(getItemKey(pq.metadata.WriteIndex), op.Value))
 		pq.metadata.WriteIndex++
 		moved++

@@ -15,6 +15,7 @@ import (
 	"go.opentelemetry.io/collector/config/configoptional"
 	"go.opentelemetry.io/collector/confmap"
 	"go.opentelemetry.io/collector/confmap/confmaptest"
+	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/queue"
 	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/request"
 )
 
@@ -49,6 +50,21 @@ func TestConfig_Validate(t *testing.T) {
 
 	cfg = newTestConfig()
 	cfg.Sizer = request.SizerTypeBytes
+	require.NoError(t, confmap.Validate(cfg))
+
+	cfg = newTestConfig()
+	cfg.StorageCompression = queue.StorageCompressionZstd
+	require.EqualError(t, confmap.Validate(cfg), "`storage_compression` requires a persistent queue configured with `storage`")
+
+	cfg = newTestConfig()
+	cfg.StorageID = &storageID
+	cfg.StorageCompression = "gzip"
+	require.EqualError(t, confmap.Validate(cfg), "storage_compression: unsupported storage compression \"gzip\"")
+
+	cfg = newTestConfig()
+	cfg.StorageID = &storageID
+	cfg.Sizer = request.SizerTypeBytes
+	cfg.StorageCompression = queue.StorageCompressionZstd
 	require.NoError(t, confmap.Validate(cfg))
 }
 
