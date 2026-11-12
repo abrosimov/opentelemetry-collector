@@ -220,6 +220,29 @@ func (m *fakeStorageClientWithErrors) Reset() {
 	m.nextErrorIndex = 0
 }
 
+// fakeStorageClientWithFailingSets fails the next failSets batches that set a value, like a full disk
+// that still serves reads and deletes.
+type fakeStorageClientWithFailingSets struct {
+	storage.Client
+	failSets atomic.Int64
+}
+
+func newFakeStorageClientWithFailingSets(tb testing.TB, ext storage.Extension) *fakeStorageClientWithFailingSets {
+	client, err := ext.GetClient(context.Background(), component.KindExporter, component.ID{}, pipeline.SignalTraces.String())
+	require.NoError(tb, err)
+	return &fakeStorageClientWithFailingSets{Client: client}
+}
+
+func (m *fakeStorageClientWithFailingSets) Batch(ctx context.Context, ops ...*storage.Operation) error {
+	for _, op := range ops {
+		if op.Type == storage.Set && m.failSets.Load() > 0 {
+			m.failSets.Add(-1)
+			return fmt.Errorf("insufficient space available: %w", syscall.ENOSPC)
+		}
+	}
+	return m.Client.Batch(ctx, ops...)
+}
+
 type fakeReferenceCounter struct {
 	mu  sync.Mutex
 	ref int64
@@ -894,12 +917,12 @@ func TestPersistentQueue_StorageFull(t *testing.T) {
 	// Put enough items in to fill the underlying storage
 	reqCount := 0
 	for {
-		reqCount++
 		err = ps.Offer(context.Background(), intRequest(50))
 		if errors.Is(err, syscall.ENOSPC) {
 			break
 		}
 		require.NoError(t, err)
+		reqCount++
 	}
 
 	// Check that the size is correct
@@ -908,21 +931,100 @@ func TestPersistentQueue_StorageFull(t *testing.T) {
 	// Manually set the storage to support writing the dispatch value.
 	client.SetMaxSizeInBytes(client.GetSizeInBytes() + 19)
 
-	// Take out all the items except last. Last one is there only in metadata because the data write failed.
-	for i := 0; i < reqCount-1; i++ {
+	for range reqCount {
 		require.True(t, consume(ps, func(_ context.Context, val intRequest) error {
 			require.Equal(t, intRequest(50), val)
 			return nil
 		}))
 	}
-	require.Equal(t, int64(1), ps.Size())
-	// Add one more element, and then read (drain) so metadata will be fixed.
+	require.Equal(t, int64(0), ps.Size())
 	require.NoError(t, ps.Offer(context.Background(), intRequest(50)))
 	require.True(t, consume(ps, func(_ context.Context, val intRequest) error {
 		require.Equal(t, intRequest(50), val)
 		return nil
 	}))
 	require.Equal(t, int64(0), ps.Size())
+}
+
+func TestPersistentQueue_FailedOfferKeepsSize(t *testing.T) {
+	for _, sizerType := range []request.SizerType{request.SizerTypeRequests, request.SizerTypeItems, request.SizerTypeBytes} {
+		t.Run(sizerType.String(), func(t *testing.T) {
+			client := newFakeStorageClientWithFailingSets(t, storagetest.NewMockStorageExtension(nil))
+			pq := newPersistentQueue[intRequest](newSettingsWithStorage(sizerType, 1000)).(*persistentQueue[intRequest])
+			pq.initClient(context.Background(), client)
+
+			require.NoError(t, pq.Offer(context.Background(), intRequest(5)))
+			sizeBefore := pq.Size()
+
+			client.failSets.Store(1)
+			require.ErrorIs(t, pq.Offer(context.Background(), intRequest(7)), syscall.ENOSPC)
+			assert.Equal(t, sizeBefore, pq.Size())
+
+			require.NoError(t, pq.Offer(context.Background(), intRequest(3)))
+			for _, want := range []intRequest{5, 3} {
+				require.True(t, consume(pq, func(_ context.Context, got intRequest) error {
+					assert.Equal(t, want, got)
+					return nil
+				}))
+			}
+			assert.Equal(t, int64(0), pq.Size())
+			require.NoError(t, pq.Shutdown(context.Background()))
+		})
+	}
+}
+
+func TestPersistentQueue_ItemDroppedOnReadReleasesSpace(t *testing.T) {
+	client := newFakeStorageClientWithFailingSets(t, storagetest.NewMockStorageExtension(nil))
+	set := newSettingsWithStorage(request.SizerTypeItems, 60)
+	set.BlockOnOverflow = true
+	pq := newPersistentQueue[intRequest](set).(*persistentQueue[intRequest])
+	pq.initClient(context.Background(), client)
+
+	require.NoError(t, pq.Offer(context.Background(), intRequest(40)))
+	require.NoError(t, pq.Offer(context.Background(), intRequest(20)))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	offerErr := make(chan error, 1)
+	go func() {
+		offerErr <- pq.Offer(ctx, intRequest(30))
+	}()
+	require.Eventually(t, func() bool {
+		pq.mu.Lock()
+		defer pq.mu.Unlock()
+		return pq.hasMoreSpace.waiting == 1
+	}, time.Second, time.Millisecond)
+
+	// Persisting the dispatch of the first item fails, so the queue drops it.
+	client.failSets.Store(1)
+	_, req, done, ok := pq.Read(context.Background())
+	require.True(t, ok)
+	assert.Equal(t, intRequest(20), req)
+
+	require.NoError(t, <-offerErr)
+	assert.Equal(t, int64(50), pq.Size())
+	done.OnDone(nil)
+	assert.Equal(t, int64(30), pq.Size())
+	require.NoError(t, pq.Shutdown(context.Background()))
+}
+
+func TestPersistentQueue_FailedRequeueOnStartReleasesSize(t *testing.T) {
+	ext := storagetest.NewMockStorageExtension(nil)
+	pq := createTestPersistentQueueWithItemsSizer(t, ext, 100)
+	require.NoError(t, pq.Offer(context.Background(), intRequest(40)))
+	require.NoError(t, pq.Offer(context.Background(), intRequest(20)))
+	require.True(t, consume(pq, func(context.Context, intRequest) error {
+		return experr.NewShutdownErr(nil)
+	}))
+	require.NoError(t, pq.Shutdown(context.Background()))
+
+	client := newFakeStorageClientWithFailingSets(t, ext)
+	client.failSets.Store(1)
+	newPQ := newPersistentQueue[intRequest](newSettingsWithStorage(request.SizerTypeItems, 100)).(*persistentQueue[intRequest])
+	newPQ.initClient(context.Background(), client)
+
+	assert.Equal(t, int64(20), newPQ.Size())
+	require.NoError(t, newPQ.Shutdown(context.Background()))
 }
 
 func TestPersistentQueue_ItemDispatchingFinish_ErrorHandling(t *testing.T) {
