@@ -70,18 +70,20 @@ type Queue[T any] interface {
 
 // Settings define internal parameters for a new Queue creation.
 type Settings[T request.Request] struct {
-	SizerType        request.SizerType
-	Capacity         int64
-	NumConsumers     int
-	WaitForResult    bool
-	BlockOnOverflow  bool
-	Signal           pipeline.Signal
-	StorageID        configoptional.Optional[configstorage.ID]
-	ReferenceCounter ReferenceCounter[T]
-	Encoding         Encoding[T]
-	ID               component.ID
-	Telemetry        component.TelemetrySettings
-	ObsMetrics       queuebatchtelemetry.ObsMetrics
+	SizerType       request.SizerType
+	Capacity        int64
+	NumConsumers    int
+	WaitForResult   bool
+	BlockOnOverflow bool
+	Signal          pipeline.Signal
+	StorageID       configoptional.Optional[configstorage.ID]
+	// StorageCompression compresses the items a persistent queue stores. It has no effect without StorageID.
+	StorageCompression StorageCompression
+	ReferenceCounter   ReferenceCounter[T]
+	Encoding           Encoding[T]
+	ID                 component.ID
+	Telemetry          component.TelemetrySettings
+	ObsMetrics         queuebatchtelemetry.ObsMetrics
 }
 
 func NewQueue[T request.Request](set Settings[T], next ConsumeFunc[T]) (Queue[T], error) {

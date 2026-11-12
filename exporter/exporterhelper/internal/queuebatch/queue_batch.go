@@ -60,18 +60,19 @@ func NewQueueBatch(
 	}
 
 	q, err := queue.NewQueue(queue.Settings[request.Request]{
-		SizerType:        cfg.Sizer,
-		Capacity:         cfg.QueueSize,
-		NumConsumers:     cfg.NumConsumers,
-		WaitForResult:    cfg.WaitForResult,
-		BlockOnOverflow:  cfg.BlockOnOverflow,
-		Signal:           set.Signal,
-		StorageID:        cfg.StorageID,
-		ReferenceCounter: set.ReferenceCounter,
-		Encoding:         set.Encoding,
-		ID:               set.ID,
-		Telemetry:        set.Telemetry,
-		ObsMetrics:       set.ObsMetrics,
+		SizerType:          cfg.Sizer,
+		Capacity:           cfg.QueueSize,
+		NumConsumers:       cfg.NumConsumers,
+		WaitForResult:      cfg.WaitForResult,
+		BlockOnOverflow:    cfg.BlockOnOverflow,
+		Signal:             set.Signal,
+		StorageID:          cfg.StorageID,
+		StorageCompression: cfg.StorageCompression,
+		ReferenceCounter:   set.ReferenceCounter,
+		Encoding:           set.Encoding,
+		ID:                 set.ID,
+		Telemetry:          set.Telemetry,
+		ObsMetrics:         set.ObsMetrics,
 	}, b.Consume)
 	if err != nil {
 		return nil, err

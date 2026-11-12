@@ -12,6 +12,7 @@ import (
 	"go.opentelemetry.io/collector/config/configoptional"
 	"go.opentelemetry.io/collector/config/configstorage"
 	"go.opentelemetry.io/collector/confmap"
+	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/queue"
 	"go.opentelemetry.io/collector/exporter/exporterhelper/internal/request"
 )
 
@@ -35,6 +36,12 @@ type Config struct {
 	// StorageID if not empty, enables the persistent storage and uses the component specified
 	// as a storage extension for the persistent queue.
 	StorageID configoptional.Optional[configstorage.ID] `mapstructure:"storage"`
+
+	// StorageCompression compresses every item a persistent queue stores, with "zstd", or stores it as
+	// encoded, with "none" or when unset. With "zstd" and the "bytes" sizer, `queue_size` counts the
+	// compressed bytes an item takes in storage instead of its uncompressed size, so it is measured in the
+	// same unit as a storage size limit. Items already stored are read whatever this is set to.
+	StorageCompression queue.StorageCompression `mapstructure:"storage_compression"`
 
 	// NumConsumers is the maximum number of concurrent consumers from the queue.
 	// This applies across all different optional configurations from above (e.g. wait_for_result, block_on_overflow, storage, etc.).
@@ -77,6 +84,10 @@ func (cfg *Config) Validate() error {
 	// Only support request sizer for persistent queue at this moment.
 	if cfg.StorageID.HasValue() && cfg.WaitForResult {
 		return errors.New("`wait_for_result` is not supported with a persistent queue configured with `storage`")
+	}
+
+	if !cfg.StorageID.HasValue() && cfg.StorageCompression.Enabled() {
+		return errors.New("`storage_compression` requires a persistent queue configured with `storage`")
 	}
 
 	if cfg.Batch.HasValue() && cfg.Batch.Get().Sizer == cfg.Sizer {

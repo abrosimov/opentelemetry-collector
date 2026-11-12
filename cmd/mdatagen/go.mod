@@ -54,6 +54,7 @@ require (
 require (
 	github.com/cenkalti/backoff/v7 v7.0.3 // indirect
 	github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
+	github.com/klauspost/compress v1.20.4 // indirect
 	go.opentelemetry.io/collector/client v1.71.0 // indirect
 	go.opentelemetry.io/collector/config/configretry v1.71.0 // indirect
 	go.opentelemetry.io/collector/config/configstorage v0.165.0 // indirect

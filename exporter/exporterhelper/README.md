@@ -97,6 +97,11 @@ To use the persistent queue, the following setting needs to be set:
 - `sending_queue`
   - `storage` (default = none): When set, enables persistence and uses the component specified as a storage extension for the persistent queue.
     There is no in-memory queue when set.
+  - `storage_compression` (default = none): `zstd` compresses every item the persistent queue stores, `none`
+    stores it uncompressed. With `zstd` and the `bytes` sizer, `queue_size` counts the compressed bytes an item
+    takes in storage rather than its uncompressed size, so it is measured in the same unit as the storage
+    extension's own size limit. Items already stored are read whatever this is set to; after it is changed on a
+    queue that still holds items, the reported size is approximate until the queue drains.
 
 The maximum number of batches stored to disk can be controlled using `sending_queue.queue_size` parameter (which,
 similarly as for in-memory buffering, defaults to 1000 batches).

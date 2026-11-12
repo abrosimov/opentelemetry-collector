@@ -69,6 +69,10 @@ $defs:
         description: 'StorageID if not empty, enables the persistent storage and uses the component specified as a storage extension for the persistent queue.'
         x-optional: true
         $ref: go.opentelemetry.io/collector/config/configstorage.ID
+      storage_compression:
+        description: StorageCompression compresses every item a persistent queue stores, with "zstd", or stores it as encoded, with "none" or when unset. With "zstd" and the "bytes" sizer, `queue_size` counts the compressed bytes an item takes in storage instead of its uncompressed size, so it is measured in the same unit as a storage size limit. Items already stored are read whatever this is set to.
+        type: string
+        x-customType: go.opentelemetry.io/collector/exporter/exporterhelper/internal/queue.StorageCompression
       wait_for_result:
         description: WaitForResult determines if incoming requests are blocked until the request is processed or not. Currently, this option is not available when persistent queue is configured using the storage configuration.
         type: boolean
