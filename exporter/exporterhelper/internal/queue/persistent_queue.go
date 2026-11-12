@@ -283,33 +283,38 @@ func (pq *persistentQueue[T]) Offer(ctx context.Context, req T) error {
 		}
 	}
 
-	pq.metadata.ItemsSize += pq.itemsSizer.Sizeof(req)
-	pq.metadata.BytesSize += pq.bytesSizer.Sizeof(req)
+	itemsSize := pq.itemsSizer.Sizeof(req)
+	bytesSize := pq.bytesSizer.Sizeof(req)
+	pq.metadata.ItemsSize += itemsSize
+	pq.metadata.BytesSize += bytesSize
 
-	return pq.putInternal(ctx, req)
+	if err := pq.putInternal(ctx, req); err != nil {
+		pq.metadata.ItemsSize -= itemsSize
+		pq.metadata.BytesSize -= bytesSize
+		return err
+	}
+	return nil
 }
 
 // putInternal adds the request to the storage without updating items/bytes sizes.
+// On error the write index is left unchanged.
 func (pq *persistentQueue[T]) putInternal(ctx context.Context, req T) error {
-	pq.metadata.WriteIndex++
-
-	metadataBuf, err := proto.Marshal(&pq.metadata)
-	if err != nil {
-		return err
-	}
-
 	reqBuf, err := pq.encoding.Marshal(ctx, req)
 	if err != nil {
 		return err
 	}
-	// Carry out a transaction where we both add the item and update the write index
-	ops := []*storage.Operation{
-		storage.SetOperation(metadataKey, metadataBuf),
-		storage.SetOperation(getItemKey(pq.metadata.WriteIndex-1), reqBuf),
+
+	pq.metadata.WriteIndex++
+	metadataBuf, err := proto.Marshal(&pq.metadata)
+	if err == nil {
+		// Carry out a transaction where we both add the item and update the write index
+		err = pq.client.Batch(ctx,
+			storage.SetOperation(metadataKey, metadataBuf),
+			storage.SetOperation(getItemKey(pq.metadata.WriteIndex-1), reqBuf))
 	}
-	if err := pq.client.Batch(ctx, ops...); err != nil {
-		// At this moment, metadata may be updated in the storage, so we cannot just revert changes to the
-		// metadata, rely on the sizes being fixed on complete draining.
+	if err != nil {
+		// Anything the storage kept from this batch is overwritten by the next metadata write and the next put.
+		pq.metadata.WriteIndex--
 		return err
 	}
 
@@ -371,6 +376,8 @@ func (pq *persistentQueue[T]) getNextItem(ctx context.Context) (uint64, T, conte
 	err = pq.client.Batch(ctx, storage.SetOperation(metadataKey, metadataBytes), getOp)
 	if err == nil {
 		restoredCtx, req, err = pq.encoding.Unmarshal(getOp.Value)
+	} else {
+		pq.releaseStoredItemSize(ctx, index)
 	}
 
 	if err != nil {
@@ -388,6 +395,25 @@ func (pq *persistentQueue[T]) getNextItem(ctx context.Context) (uint64, T, conte
 	pq.refClient++
 
 	return index, req, restoredCtx, true
+}
+
+// releaseStoredItemSize releases the size of an item that is about to be dropped, if the item can still be read.
+// The size of an item that cannot be read or decoded is unknown and stays counted until the queue drains.
+func (pq *persistentQueue[T]) releaseStoredItemSize(ctx context.Context, index uint64) {
+	buf, err := pq.client.Get(ctx, getItemKey(index))
+	if err != nil {
+		return
+	}
+	_, req, err := pq.encoding.Unmarshal(buf)
+	if err != nil {
+		return
+	}
+	pq.releaseSize(req)
+}
+
+func (pq *persistentQueue[T]) releaseSize(req T) {
+	pq.metadata.ItemsSize = max(pq.metadata.ItemsSize-pq.itemsSizer.Sizeof(req), 0)
+	pq.metadata.BytesSize = max(pq.metadata.BytesSize-pq.bytesSizer.Sizeof(req), 0)
 }
 
 // onDone should be called to remove the item of the given index from the queue once processing is finished.
@@ -485,6 +511,7 @@ func (pq *persistentQueue[T]) enqueueNotDispatchedReqs(ctx context.Context, disp
 			continue
 		}
 		if pq.putInternal(reqCtx, req) != nil { //nolint:contextcheck
+			pq.releaseSize(req)
 			errCount++
 		}
 	}
