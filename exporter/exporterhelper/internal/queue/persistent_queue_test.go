@@ -304,10 +304,11 @@ func TestPersistentQueue_FullCapacity(t *testing.T) {
 			sizeMultiplier: 10,
 		},
 		{
+			// The bytes sizer counts the stored item: intRequest(10) is stored as "10", two bytes.
 			name:           "bytes_capacity",
 			sizerType:      request.SizerTypeBytes,
-			capacity:       550,
-			sizeMultiplier: 100,
+			capacity:       11,
+			sizeMultiplier: 2,
 		},
 	}
 	for _, tt := range tests {
@@ -1187,4 +1188,47 @@ func itemIndexArrayToBytes(arr []uint64) []byte {
 		buf = binary.LittleEndian.AppendUint64(buf, item)
 	}
 	return buf
+}
+
+// An encoding that changes the size of a request, such as one that compresses it, is counted at the size it
+// stores, not at the request's own bytes size.
+type paddedEncoding struct {
+	int64Encoding
+	padding int
+}
+
+func (pe paddedEncoding) Marshal(ctx context.Context, val intRequest) ([]byte, error) {
+	buf, err := pe.int64Encoding.Marshal(ctx, val)
+	return append(buf, make([]byte, pe.padding)...), err
+}
+
+func (pe paddedEncoding) Unmarshal(buf []byte) (context.Context, intRequest, error) {
+	return pe.int64Encoding.Unmarshal(buf[:len(buf)-pe.padding])
+}
+
+func TestPersistentQueue_BytesSizerCountsStoredBytes(t *testing.T) {
+	ext := storagetest.NewMockStorageExtension(nil)
+	set := newSettingsWithStorage(request.SizerTypeBytes, 25)
+	set.Encoding = paddedEncoding{int64Encoding: set.Encoding.(int64Encoding), padding: 10}
+	pq := newPersistentQueue[intRequest](set)
+	require.NoError(t, pq.Start(context.Background(), hosttest.NewHost(map[component.ID]component.Component{{}: ext})))
+
+	// intRequest(5) reports 50 bytes of its own but is stored as "5" plus ten bytes of padding.
+	require.NoError(t, pq.Offer(context.Background(), intRequest(5)))
+	assert.Equal(t, int64(11), pq.Size())
+	require.NoError(t, pq.Offer(context.Background(), intRequest(7)))
+	assert.Equal(t, int64(22), pq.Size())
+	require.ErrorIs(t, pq.Offer(context.Background(), intRequest(9)), ErrQueueIsFull)
+	require.NoError(t, pq.Shutdown(context.Background()))
+
+	// The size survives a restart and is released at the stored size when the item is done.
+	restarted := newPersistentQueue[intRequest](set)
+	require.NoError(t, restarted.Start(context.Background(), hosttest.NewHost(map[component.ID]component.Component{{}: ext})))
+	assert.Equal(t, int64(22), restarted.Size())
+	require.True(t, consume(restarted.(*persistentQueue[intRequest]), func(_ context.Context, got intRequest) error {
+		assert.Equal(t, intRequest(5), got)
+		return nil
+	}))
+	assert.Equal(t, int64(11), restarted.Size())
+	require.NoError(t, restarted.Shutdown(context.Background()))
 }
