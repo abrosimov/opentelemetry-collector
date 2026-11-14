@@ -26,7 +26,9 @@ The following configuration options can be modified:
   - `sizer` (default = requests): How the queue and batching is measured. Available options:
     - `requests`: number of incoming batches of metrics, logs, traces (the most performant option);
     - `items`: number of the smallest parts of each signal (spans, metric data points, log records);
-    - `bytes`: the size of serialized data in bytes (the least performant option).
+    - `bytes`: the size of serialized data in bytes (the least performant option). A persistent queue counts the
+      bytes each item takes in storage, as its encoding stored it, so `queue_size` is in the same unit as the
+      storage extension's size limit.
   - `queue_size` (default = 1000): Maximum size the queue can accept. Measured in units defined by `sizer`
   - `batch`: see below.
 

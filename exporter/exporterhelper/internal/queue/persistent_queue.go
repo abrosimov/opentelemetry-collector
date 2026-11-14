@@ -81,7 +81,6 @@ type persistentQueue[T request.Request] struct {
 	sizerType   request.SizerType
 	activeSizer request.Sizer
 	itemsSizer  request.Sizer
-	bytesSizer  request.Sizer
 	storageID   component.ID
 	id          component.ID
 	signal      pipeline.Signal
@@ -109,7 +108,6 @@ func newPersistentQueue[T request.Request](set Settings[T]) readableQueue[T] {
 		sizerType:       set.SizerType,
 		activeSizer:     request.NewSizer(set.SizerType),
 		itemsSizer:      request.NewItemsSizer(),
-		bytesSizer:      request.NewBytesSizer(),
 		storageID:       *set.StorageID,
 		id:              set.ID,
 		signal:          set.Signal,
@@ -278,13 +276,14 @@ func (pq *persistentQueue[T]) unrefClient(ctx context.Context) error {
 // without violating capacity restrictions. If success returns no error.
 // It returns ErrQueueIsFull if no space is currently available.
 func (pq *persistentQueue[T]) Offer(ctx context.Context, req T) error {
-	// Encode before taking the lock: encoding reads nothing the lock guards.
+	// Encode before taking the lock: the bytes size is the size of the encoded item, and encoding reads
+	// nothing the lock guards.
 	buf, err := pq.encode(ctx, req)
 	if err != nil {
 		return err
 	}
 	itemsSize := pq.itemsSizer.Sizeof(req)
-	bytesSize := pq.bytesSizeOf(req, buf)
+	bytesSize := storedSize(buf)
 	size := pq.activeSizeOf(req, itemsSize, bytesSize)
 
 	pq.mu.Lock()
@@ -320,9 +319,11 @@ func (pq *persistentQueue[T]) decode(stored []byte) (context.Context, T, error) 
 	return pq.encoding.Unmarshal(stored)
 }
 
-// bytesSizeOf returns the size the bytes sizer counts for a stored item.
-func (pq *persistentQueue[T]) bytesSizeOf(req T, _ []byte) int64 {
-	return pq.bytesSizer.Sizeof(req)
+// storedSize returns the size the bytes sizer counts for an item: the bytes it takes in storage. Measuring what
+// is stored, rather than the request before encoding, puts `queue_size` in the unit a storage extension's size
+// limit uses, whatever the encoding does to the request, including compressing it.
+func storedSize(stored []byte) int64 {
+	return int64(len(stored))
 }
 
 func (pq *persistentQueue[T]) activeSizeOf(req T, itemsSize, bytesSize int64) int64 {
@@ -476,7 +477,7 @@ func (pq *persistentQueue[T]) getNextItem(ctx context.Context) (dispatchedItem[T
 	// The client cannot be closed because we hold the lock since last we checked `stopped`.
 	pq.refClient++
 
-	return dispatchedItem[T]{index: index, req: req, ctx: restoredCtx, bytesSize: pq.bytesSizeOf(req, getOp.Value)}, true, nil
+	return dispatchedItem[T]{index: index, req: req, ctx: restoredCtx, bytesSize: storedSize(getOp.Value)}, true, nil
 }
 
 // onDone should be called to remove the item of the given index from the queue once processing is finished.
