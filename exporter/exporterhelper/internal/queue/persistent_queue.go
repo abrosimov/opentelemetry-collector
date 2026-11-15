@@ -267,26 +267,20 @@ func (pq *persistentQueue[T]) unrefClient(ctx context.Context) error {
 // without violating capacity restrictions. If success returns no error.
 // It returns ErrQueueIsFull if no space is currently available.
 func (pq *persistentQueue[T]) Offer(ctx context.Context, req T) error {
-	// Encode before taking the lock: the bytes size is the size of the encoded item, and encoding reads
-	// nothing the lock guards.
+	// The bytes sizer counts the encoded item, so `queue_size` is in the unit of a storage size limit. Its size
+	// depends on the request context too, so it is known only once encoded. Encoding reads nothing the lock guards.
 	reqBuf, err := pq.encoding.Marshal(ctx, req)
 	if err != nil {
 		return err
 	}
-	itemsSize := pq.itemsSizer.Sizeof(req)
-	bytesSize := storedSize(reqBuf)
+	bytesSize := int64(len(reqBuf))
 
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
 
-	var size int64
-	switch pq.sizerType {
-	case request.SizerTypeBytes:
+	size := pq.activeSizer.Sizeof(req)
+	if pq.sizerType == request.SizerTypeBytes {
 		size = bytesSize
-	case request.SizerTypeItems:
-		size = itemsSize
-	default:
-		size = pq.activeSizer.Sizeof(req)
 	}
 	for pq.internalSize()+size > pq.capacity {
 		if !pq.blockOnOverflow {
@@ -297,21 +291,23 @@ func (pq *persistentQueue[T]) Offer(ctx context.Context, req T) error {
 		}
 	}
 
-	pq.metadata.ItemsSize += itemsSize
+	pq.metadata.ItemsSize += pq.itemsSizer.Sizeof(req)
 	pq.metadata.BytesSize += bytesSize
 
-	return pq.putInternal(ctx, reqBuf)
+	return pq.putEncoded(ctx, reqBuf)
 }
 
-// storedSize returns the size the bytes sizer counts for an item: the bytes it takes in storage. Measuring what
-// is stored, rather than the request before encoding, puts `queue_size` in the unit a storage extension's size
-// limit uses, whatever the encoding does to the request, including compressing it.
-func storedSize(stored []byte) int64 {
-	return int64(len(stored))
+// putInternal adds the request to the storage without updating items/bytes sizes.
+func (pq *persistentQueue[T]) putInternal(ctx context.Context, req T) error {
+	reqBuf, err := pq.encoding.Marshal(ctx, req)
+	if err != nil {
+		return err
+	}
+	return pq.putEncoded(ctx, reqBuf)
 }
 
-// putInternal adds the encoded request to the storage without updating items/bytes sizes.
-func (pq *persistentQueue[T]) putInternal(ctx context.Context, reqBuf []byte) error {
+// putEncoded adds the encoded request to the storage without updating items/bytes sizes.
+func (pq *persistentQueue[T]) putEncoded(ctx context.Context, reqBuf []byte) error {
 	pq.metadata.WriteIndex++
 
 	metadataBuf, err := proto.Marshal(&pq.metadata)
@@ -403,7 +399,7 @@ func (pq *persistentQueue[T]) getNextItem(ctx context.Context) (uint64, T, conte
 	// The client cannot be closed because we hold the lock since last we checked `stopped`.
 	pq.refClient++
 
-	return index, req, restoredCtx, storedSize(getOp.Value), true
+	return index, req, restoredCtx, int64(len(getOp.Value)), true
 }
 
 // onDone should be called to remove the item of the given index from the queue once processing is finished.
@@ -494,13 +490,13 @@ func (pq *persistentQueue[T]) enqueueNotDispatchedReqs(ctx context.Context, disp
 			pq.logger.Warn("Failed retrieving item", zap.String(zapKey, op.Key), zap.Error(errValueNotSet))
 			continue
 		}
+		reqCtx, req, err := pq.encoding.Unmarshal(op.Value)
 		// If error happened or item is nil, it will be efficiently ignored
-		if _, _, err := pq.encoding.Unmarshal(op.Value); err != nil {
+		if err != nil {
 			pq.logger.Warn("Failed unmarshalling item", zap.String(zapKey, op.Key), zap.Error(err))
 			continue
 		}
-		// The stored value is put back as it is: its size is still counted.
-		if pq.putInternal(ctx, op.Value) != nil {
+		if pq.putInternal(reqCtx, req) != nil { //nolint:contextcheck
 			errCount++
 		}
 	}
