@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"strconv"
 	"sync"
+	"time"
 
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
@@ -40,6 +41,10 @@ var (
 	errNoStorageClient    = errors.New("no storage client extension found")
 	errWrongExtensionType = errors.New("requested extension is not a storage extension")
 )
+
+// readRetryInterval is how long a reader waits before it reads an item again whose dispatch could not be
+// persisted. A variable so that tests can shorten it.
+var readRetryInterval = time.Second
 
 var indexDonePool = sync.Pool{
 	New: func() any {
@@ -89,6 +94,8 @@ type persistentQueue[T request.Request] struct {
 	metadata        PersistentMetadata
 	refClient       int64
 	stopped         bool
+	stopCh          chan struct{}
+	readFailures    int
 
 	blockOnOverflow bool
 }
@@ -108,6 +115,7 @@ func newPersistentQueue[T request.Request](set Settings[T]) readableQueue[T] {
 		signal:          set.Signal,
 		blockOnOverflow: set.BlockOnOverflow,
 	}
+	pq.stopCh = make(chan struct{})
 	pq.hasMoreElements = sync.NewCond(&pq.mu)
 	pq.hasMoreSpace = newCond(&pq.mu)
 	return pq
@@ -251,6 +259,9 @@ func (pq *persistentQueue[T]) Shutdown(ctx context.Context) error {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
 	// Mark this queue as stopped, so consumer don't start any more work.
+	if !pq.stopped {
+		close(pq.stopCh)
+	}
 	pq.stopped = true
 	pq.hasMoreElements.Broadcast()
 	return pq.unrefClient(ctx)
@@ -346,6 +357,10 @@ func (pq *persistentQueue[T]) Read(ctx context.Context) (context.Context, T, Don
 				id.reset(index, pq.itemsSizer.Sizeof(req), pq.bytesSizer.Sizeof(req), pq)
 				return reqCtx, req, id, true
 			}
+			if pq.stopped {
+				var req T
+				return context.Background(), req, nil, false
+			}
 			// More space available, data was dropped.
 			pq.hasMoreSpace.Signal()
 		}
@@ -374,10 +389,21 @@ func (pq *persistentQueue[T]) getNextItem(ctx context.Context) (uint64, T, conte
 
 	getOp := storage.GetOperation(getItemKey(index))
 	err = pq.client.Batch(ctx, storage.SetOperation(metadataKey, metadataBytes), getOp)
+	if err != nil {
+		// The batch is one transaction, so the storage still holds the metadata from before this read. The item
+		// was accepted: keep it at the read index and read it again after a wait, rather than drop it.
+		pq.metadata.ReadIndex--
+		pq.metadata.CurrentlyDispatchedItems = pq.metadata.CurrentlyDispatchedItems[:len(pq.metadata.CurrentlyDispatchedItems)-1]
+		pq.waitAfterDispatchFailure(err)
+		return 0, req, restoredCtx, false
+	}
+	if pq.readFailures > 0 {
+		pq.logger.Info("Persisting the dispatch of queue items succeeded again", zap.Int("failedAttempts", pq.readFailures))
+		pq.readFailures = 0
+	}
+
 	if err == nil {
 		restoredCtx, req, err = pq.encoding.Unmarshal(getOp.Value)
-	} else {
-		pq.releaseStoredItemSize(ctx, index)
 	}
 
 	if err != nil {
@@ -397,18 +423,22 @@ func (pq *persistentQueue[T]) getNextItem(ctx context.Context) (uint64, T, conte
 	return index, req, restoredCtx, true
 }
 
-// releaseStoredItemSize releases the size of an item that is about to be dropped, if the item can still be read.
-// The size of an item that cannot be read or decoded is unknown and stays counted until the queue drains.
-func (pq *persistentQueue[T]) releaseStoredItemSize(ctx context.Context, index uint64) {
-	buf, err := pq.client.Get(ctx, getItemKey(index))
-	if err != nil {
-		return
+// waitAfterDispatchFailure releases the lock for readRetryInterval, or until the queue stops, after the dispatch
+// of an item could not be persisted. Callers MUST hold the mutex.
+func (pq *persistentQueue[T]) waitAfterDispatchFailure(err error) {
+	pq.readFailures++
+	if pq.readFailures == 1 {
+		pq.logger.Error("Failed to persist the dispatch of a queue item; the item stays in the queue and is read again",
+			zap.Error(err), zap.Duration("interval", readRetryInterval))
+	} else {
+		pq.logger.Debug("Failed again to persist the dispatch of a queue item", zap.Error(err), zap.Int("attempts", pq.readFailures))
 	}
-	_, req, err := pq.encoding.Unmarshal(buf)
-	if err != nil {
-		return
+	pq.mu.Unlock()
+	select {
+	case <-time.After(readRetryInterval):
+	case <-pq.stopCh:
 	}
-	pq.releaseSize(req)
+	pq.mu.Lock()
 }
 
 func (pq *persistentQueue[T]) releaseSize(req T) {
