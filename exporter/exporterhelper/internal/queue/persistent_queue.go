@@ -83,7 +83,6 @@ type persistentQueue[T request.Request] struct {
 	sizerType   request.SizerType
 	activeSizer request.Sizer
 	itemsSizer  request.Sizer
-	bytesSizer  request.Sizer
 	storageID   component.ID
 	id          component.ID
 	signal      pipeline.Signal
@@ -110,7 +109,6 @@ func newPersistentQueue[T request.Request](set Settings[T]) readableQueue[T] {
 		sizerType:       set.SizerType,
 		activeSizer:     request.NewSizer(set.SizerType),
 		itemsSizer:      request.NewItemsSizer(),
-		bytesSizer:      request.NewBytesSizer(),
 		storageID:       *set.StorageID,
 		id:              set.ID,
 		signal:          set.Signal,
@@ -281,10 +279,21 @@ func (pq *persistentQueue[T]) unrefClient(ctx context.Context) error {
 // without violating capacity restrictions. If success returns no error.
 // It returns ErrQueueIsFull if no space is currently available.
 func (pq *persistentQueue[T]) Offer(ctx context.Context, req T) error {
+	// The bytes sizer counts the encoded item, so `queue_size` is in the unit of a storage size limit. Its size
+	// depends on the request context too, so it is known only once encoded. Encoding reads nothing the lock guards.
+	reqBuf, err := pq.encoding.Marshal(ctx, req)
+	if err != nil {
+		return err
+	}
+	bytesSize := int64(len(reqBuf))
+
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
 
 	size := pq.activeSizer.Sizeof(req)
+	if pq.sizerType == request.SizerTypeBytes {
+		size = bytesSize
+	}
 	for pq.internalSize()+size > pq.capacity {
 		if !pq.blockOnOverflow {
 			return ErrQueueIsFull
@@ -295,11 +304,10 @@ func (pq *persistentQueue[T]) Offer(ctx context.Context, req T) error {
 	}
 
 	itemsSize := pq.itemsSizer.Sizeof(req)
-	bytesSize := pq.bytesSizer.Sizeof(req)
 	pq.metadata.ItemsSize += itemsSize
 	pq.metadata.BytesSize += bytesSize
 
-	if err := pq.putInternal(ctx, req); err != nil {
+	if err := pq.putEncoded(ctx, reqBuf); err != nil {
 		pq.metadata.ItemsSize -= itemsSize
 		pq.metadata.BytesSize -= bytesSize
 		return err
@@ -314,7 +322,12 @@ func (pq *persistentQueue[T]) putInternal(ctx context.Context, req T) error {
 	if err != nil {
 		return err
 	}
+	return pq.putEncoded(ctx, reqBuf)
+}
 
+// putEncoded adds the encoded request to the storage without updating items/bytes sizes.
+// On error the write index is left unchanged.
+func (pq *persistentQueue[T]) putEncoded(ctx context.Context, reqBuf []byte) error {
 	pq.metadata.WriteIndex++
 	metadataBuf, err := proto.Marshal(&pq.metadata)
 	if err == nil {
@@ -346,7 +359,7 @@ func (pq *persistentQueue[T]) Read(ctx context.Context) (context.Context, T, Don
 
 		// Read until either a successful retrieved element or no more elements in the storage.
 		for pq.metadata.ReadIndex != pq.metadata.WriteIndex {
-			index, req, reqCtx, consumed := pq.getNextItem(ctx)
+			index, req, reqCtx, bytesSize, consumed := pq.getNextItem(ctx)
 			// Ensure the used size are in sync when queue is drained.
 			if pq.requestSize() == 0 {
 				pq.metadata.BytesSize = 0
@@ -354,7 +367,7 @@ func (pq *persistentQueue[T]) Read(ctx context.Context) (context.Context, T, Don
 			}
 			if consumed {
 				id := indexDonePool.Get().(*indexDone)
-				id.reset(index, pq.itemsSizer.Sizeof(req), pq.bytesSizer.Sizeof(req), pq)
+				id.reset(index, pq.itemsSizer.Sizeof(req), bytesSize, pq)
 				return reqCtx, req, id, true
 			}
 			if pq.stopped {
@@ -374,7 +387,7 @@ func (pq *persistentQueue[T]) Read(ctx context.Context) (context.Context, T, Don
 // getNextItem pulls the next available item from the persistent storage along with its index. Once processing is
 // finished, the index should be called with onDone to clean up the storage. If no new item is available,
 // returns false.
-func (pq *persistentQueue[T]) getNextItem(ctx context.Context) (uint64, T, context.Context, bool) {
+func (pq *persistentQueue[T]) getNextItem(ctx context.Context) (uint64, T, context.Context, int64, bool) {
 	index := pq.metadata.ReadIndex
 	// Increase here, so even if errors happen below, it always iterates
 	pq.metadata.ReadIndex++
@@ -384,7 +397,7 @@ func (pq *persistentQueue[T]) getNextItem(ctx context.Context) (uint64, T, conte
 	restoredCtx := context.Background()
 	metadataBytes, err := proto.Marshal(&pq.metadata)
 	if err != nil {
-		return 0, req, restoredCtx, false
+		return 0, req, restoredCtx, 0, false
 	}
 
 	getOp := storage.GetOperation(getItemKey(index))
@@ -395,7 +408,7 @@ func (pq *persistentQueue[T]) getNextItem(ctx context.Context) (uint64, T, conte
 		pq.metadata.ReadIndex--
 		pq.metadata.CurrentlyDispatchedItems = pq.metadata.CurrentlyDispatchedItems[:len(pq.metadata.CurrentlyDispatchedItems)-1]
 		pq.waitAfterDispatchFailure(err)
-		return 0, req, restoredCtx, false
+		return 0, req, restoredCtx, 0, false
 	}
 	if pq.readFailures > 0 {
 		pq.logger.Info("Persisting the dispatch of queue items succeeded again", zap.Int("failedAttempts", pq.readFailures))
@@ -413,14 +426,14 @@ func (pq *persistentQueue[T]) getNextItem(ctx context.Context) (uint64, T, conte
 			pq.logger.Error("Error deleting item from queue", zap.Error(err))
 		}
 
-		return 0, req, restoredCtx, false
+		return 0, req, restoredCtx, 0, false
 	}
 
 	// Increase the reference count, so the client is not closed while the request is being processed.
 	// The client cannot be closed because we hold the lock since last we checked `stopped`.
 	pq.refClient++
 
-	return index, req, restoredCtx, true
+	return index, req, restoredCtx, int64(len(getOp.Value)), true
 }
 
 // waitAfterDispatchFailure releases the lock for readRetryInterval, or until the queue stops, after the dispatch
