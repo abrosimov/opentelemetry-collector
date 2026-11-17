@@ -1063,7 +1063,7 @@ func TestPersistentQueue_FailedDispatchKeepsItemAcrossRestart(t *testing.T) {
 	require.NoError(t, newPQ.Shutdown(context.Background()))
 }
 
-func TestPersistentQueue_FailedRequeueOnStartReleasesSize(t *testing.T) {
+func TestPersistentQueue_FailedRequeueOnStartKeepsItems(t *testing.T) {
 	ext := storagetest.NewMockStorageExtension(nil)
 	pq := createTestPersistentQueueWithItemsSizer(t, ext, 100)
 	require.NoError(t, pq.Offer(context.Background(), intRequest(40)))
@@ -1073,13 +1073,87 @@ func TestPersistentQueue_FailedRequeueOnStartReleasesSize(t *testing.T) {
 	}))
 	require.NoError(t, pq.Shutdown(context.Background()))
 
+	// The move of the dispatched item fails as one transaction, so it stays where it was and keeps its size.
 	client := newFakeStorageClientWithFailingSets(t, ext)
 	client.failSets.Store(1)
 	newPQ := newPersistentQueue[intRequest](newSettingsWithStorage(request.SizerTypeItems, 100)).(*persistentQueue[intRequest])
 	newPQ.initClient(context.Background(), client)
-
-	assert.Equal(t, int64(20), newPQ.Size())
+	assert.Equal(t, int64(60), newPQ.Size())
+	requireCurrentlyDispatchedItemsEqual(t, newPQ, []uint64{0})
+	require.True(t, consume(newPQ, func(_ context.Context, got intRequest) error {
+		assert.Equal(t, intRequest(20), got)
+		return nil
+	}))
+	assert.Equal(t, int64(40), newPQ.Size())
 	require.NoError(t, newPQ.Shutdown(context.Background()))
+
+	// The next start moves it.
+	lastPQ := createTestPersistentQueueWithItemsSizer(t, ext, 100)
+	assert.Equal(t, int64(40), lastPQ.Size())
+	requireCurrentlyDispatchedItemsEqual(t, lastPQ, nil)
+	require.True(t, consume(lastPQ, func(_ context.Context, got intRequest) error {
+		assert.Equal(t, intRequest(40), got)
+		return nil
+	}))
+	assert.Equal(t, int64(0), lastPQ.Size())
+	require.NoError(t, lastPQ.Shutdown(context.Background()))
+}
+
+// fakeStorageClientWithFailingDeletes fails the next failDeletes batches that delete a key and set none, like the
+// clean-up after items were copied to the back of the queue.
+type fakeStorageClientWithFailingDeletes struct {
+	storage.Client
+	failDeletes atomic.Int64
+}
+
+func (m *fakeStorageClientWithFailingDeletes) Batch(ctx context.Context, ops ...*storage.Operation) error {
+	deletes, sets := 0, 0
+	for _, op := range ops {
+		switch op.Type {
+		case storage.Delete:
+			deletes++
+		case storage.Set:
+			sets++
+		}
+	}
+	if deletes > 0 && sets == 0 && m.failDeletes.Load() > 0 {
+		m.failDeletes.Add(-1)
+		return fmt.Errorf("insufficient space available: %w", syscall.ENOSPC)
+	}
+	return m.Client.Batch(ctx, ops...)
+}
+
+func TestPersistentQueue_FailedRequeueCleanupDuplicatesInsteadOfLosing(t *testing.T) {
+	ext := storagetest.NewMockStorageExtension(nil)
+	pq := createTestPersistentQueueWithItemsSizer(t, ext, 1000)
+	require.NoError(t, pq.Offer(context.Background(), intRequest(40)))
+	require.True(t, consume(pq, func(context.Context, intRequest) error {
+		return experr.NewShutdownErr(nil)
+	}))
+	require.NoError(t, pq.Shutdown(context.Background()))
+
+	// The copy succeeds and deleting the original fails, as a crash between the two would leave it.
+	base, err := ext.GetClient(context.Background(), component.KindExporter, component.ID{}, pipeline.SignalTraces.String())
+	require.NoError(t, err)
+	client := &fakeStorageClientWithFailingDeletes{Client: base}
+	client.failDeletes.Store(1)
+	newPQ := newPersistentQueue[intRequest](newSettingsWithStorage(request.SizerTypeItems, 1000)).(*persistentQueue[intRequest])
+	newPQ.initClient(context.Background(), client)
+	requireCurrentlyDispatchedItemsEqual(t, newPQ, []uint64{0})
+	require.True(t, consume(newPQ, func(_ context.Context, got intRequest) error {
+		assert.Equal(t, intRequest(40), got)
+		return nil
+	}))
+	require.NoError(t, newPQ.Shutdown(context.Background()))
+
+	// The original is still listed as dispatched, so the next start moves it again: a duplicate, not a loss.
+	lastPQ := createTestPersistentQueueWithItemsSizer(t, ext, 1000)
+	requireCurrentlyDispatchedItemsEqual(t, lastPQ, nil)
+	require.True(t, consume(lastPQ, func(_ context.Context, got intRequest) error {
+		assert.Equal(t, intRequest(40), got)
+		return nil
+	}))
+	require.NoError(t, lastPQ.Shutdown(context.Background()))
 }
 
 func TestPersistentQueue_ItemDispatchingFinish_ErrorHandling(t *testing.T) {
