@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -166,7 +167,6 @@ func (pq *persistentQueue[T]) initClient(ctx context.Context, client storage.Cli
 	switch {
 	case err == nil:
 		pq.enqueueNotDispatchedReqs(ctx, pq.metadata.CurrentlyDispatchedItems)
-		pq.metadata.CurrentlyDispatchedItems = nil
 	case !errors.Is(err, errValueNotSet):
 		pq.logger.Error("Failed getting metadata, starting with new ones", zap.Error(err))
 		pq.metadata = PersistentMetadata{}
@@ -441,11 +441,6 @@ func (pq *persistentQueue[T]) waitAfterDispatchFailure(err error) {
 	pq.mu.Lock()
 }
 
-func (pq *persistentQueue[T]) releaseSize(req T) {
-	pq.metadata.ItemsSize = max(pq.metadata.ItemsSize-pq.itemsSizer.Sizeof(req), 0)
-	pq.metadata.BytesSize = max(pq.metadata.BytesSize-pq.bytesSizer.Sizeof(req), 0)
-}
-
 // onDone should be called to remove the item of the given index from the queue once processing is finished.
 func (pq *persistentQueue[T]) onDone(index uint64, itemsSize, bytesSize int64, consumeErr error) {
 	// Delete the item from the persistent storage after it was processed.
@@ -517,19 +512,19 @@ func (pq *persistentQueue[T]) enqueueNotDispatchedReqs(ctx context.Context, disp
 		cleanupBatch[i] = storage.DeleteOperation(key)
 	}
 	retrieveErr := pq.client.Batch(ctx, retrieveBatch...)
-	cleanupErr := pq.client.Batch(ctx, cleanupBatch...)
 
-	if cleanupErr != nil {
-		pq.logger.Debug("Failed cleaning items left by consumers", zap.Error(cleanupErr))
-	}
-
+	// Every item is copied to the back of the queue before its original is deleted, and the originals stay listed
+	// as dispatched until then, so a crash or a failed copy leaves them to be moved at the next start: a duplicate at
+	// worst, never a loss.
+	pq.metadata.CurrentlyDispatchedItems = dispatchedItems
 	if retrieveErr != nil {
 		pq.logger.Warn("Failed retrieving items left by consumers", zap.Error(retrieveErr))
 		return
 	}
 
+	var notMoved []uint64
 	errCount := 0
-	for _, op := range retrieveBatch {
+	for i, op := range retrieveBatch {
 		if op.Value == nil {
 			pq.logger.Warn("Failed retrieving item", zap.String(zapKey, op.Key), zap.Error(errValueNotSet))
 			continue
@@ -541,10 +536,17 @@ func (pq *persistentQueue[T]) enqueueNotDispatchedReqs(ctx context.Context, disp
 			continue
 		}
 		if pq.putInternal(reqCtx, req) != nil { //nolint:contextcheck
-			pq.releaseSize(req)
+			notMoved = append(notMoved, dispatchedItems[i])
+			cleanupBatch[i] = nil
 			errCount++
 		}
 	}
+	cleanupErr := pq.client.Batch(ctx, slices.DeleteFunc(cleanupBatch, func(op *storage.Operation) bool { return op == nil })...)
+	if cleanupErr != nil {
+		pq.logger.Debug("Failed cleaning items left by consumers", zap.Error(cleanupErr))
+		notMoved = dispatchedItems
+	}
+	pq.metadata.CurrentlyDispatchedItems = notMoved
 
 	if errCount > 0 {
 		pq.logger.Error("Errors occurred while moving items for dispatching back to queue",
